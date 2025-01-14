@@ -45,12 +45,6 @@
 #include "axcl/ax_buffer_tool.h"
 #include "axcl_dma_buffer.h"
 
-// HACK: Older BSP kernel use NA12 for NV15.
-#ifndef DRM_FORMAT_NV15 // fourcc_code('N', 'V', '1', '5')
-#define DRM_FORMAT_NV15 fourcc_code('N', 'A', '1', '2')
-#endif
-
-#define FPS_UPDATE_INTERVAL     120
 #define ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
 #define AX_SHIFT_LEFT_ALIGN(a) (1 << (a))
 #define VDEC_STRIDE_ALIGN AX_SHIFT_LEFT_ALIGN(8) /* VDEC stride align 256 */
@@ -120,18 +114,6 @@ struct stream_info {
     } audio;
 };
 
-static int axcl_close_decoder(AVCodecContext *avctx)
-{
-    AXCLDecodeContext *axcl_context = avctx->priv_data;
-    dma_buffer_destroy(axcl_context->cma_allocator);
-    AXCLDecoder *decoder = (AXCLDecoder *)axcl_context->decoder;
-
-    dma_buffer_free(axcl_context->cma_allocator);
-
-    av_packet_unref(&decoder->packet);
-    return 0;
-}
-
 static void axcl_release_decoder(AVRefStructOpaque opaque, void *data)
 {
     AXCLDecoder *decoder = (AXCLDecoder *)data;
@@ -165,63 +147,6 @@ static AX_S32 sample_vdec_release_frame(AX_VDEC_GRP grp, AX_VDEC_CHN chn, const 
 
 static AX_S32 sample_vdec_send_stream(AX_VDEC_GRP grp, const AX_VDEC_STREAM_T *stream, AX_S32 timeout) {
     return AXCL_VDEC_SendStream(grp, stream, timeout);
-}
-
-static int sample_get_decoded_image_thread(AVCodecContext *avctx, AVFrame *frame) {
-    AXCLDecodeContext *axcl_context = avctx->priv_data;
-    AX_VDEC_GRP grp = axcl_context->grp;
-    SAMPLE_VDEC_CHN_INFO chn_info = axcl_context->chn_info;
-    int32_t device_id = axcl_context->device_id;
-    AXCLDecoder *decoder = axcl_context->decoder;
-
-    axclError ret;
-
-    /* step01: create thread context */
-    axclrtContext context;
-    ret = axclrtCreateContext(&context, device_id);
-    if (AXCL_SUCC != ret) {
-        return ret;
-    }
-
-    const AX_VDEC_CHN chn = chn_info.u32ChnId;
-
-    const size_t size = ALIGN_UP(chn_info.u32PicWidth, VDEC_STRIDE_ALIGN) * chn_info.u32PicHeight * 3 / 2;
-//    void* cma_allocator = dma_buffer_create();
-
-    AX_VIDEO_FRAME_INFO_T axcl_frame;
-    memset(&axcl_frame, 0, sizeof(axcl_frame));
-
-    /* step02: get decoded image */
-    ret = sample_vdec_get_frame(grp, chn, &axcl_frame, -1);
-    if (0 != ret) {
-        if (AX_ERR_VDEC_UNEXIST == ret) {
-            av_log(avctx, AV_LOG_INFO, "[decoder %2d] grp is destroyed\n", grp);
-            return AX_ERR_VDEC_UNEXIST;
-        } else if (AX_ERR_VDEC_STRM_ERROR == ret) {
-            av_log(avctx, AV_LOG_WARNING, "[decoder %2d] stream is undecodeable\n", grp);
-            return AX_ERR_VDEC_STRM_ERROR;
-        } else if (AX_ERR_VDEC_FLOW_END == ret) {
-            av_log(avctx, AV_LOG_WARNING, "[decoder %2d] flow end\n", grp);
-            return AX_ERR_VDEC_FLOW_END;
-        } else {
-            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] get frame fail, ret = 0x%x\n", grp, ret);
-            return ret;
-        }
-    }
-
-    // TODO: axcl frame to ffmpeg frame
-
-    /* TODO: */
-    if (0 == ret) {
-        /* step03: release decoded image */
-        sample_vdec_release_frame(grp, chn, &axcl_frame);
-    }
-
-    /* step04: destroy thread context */
-    axclrtDestroyContext(context);
-//    cma_allocator.free();
-
-    av_log(avctx, AV_LOG_INFO, "[decoder %2d] decode thread ---\n", grp);
 }
 
 static AX_U32 sample_vdec_calc_blk_size(AX_U32 width, AX_U32 height, AX_PAYLOAD_TYPE_E payload, AX_FRAME_COMPRESS_INFO_T *fbc,
@@ -541,6 +466,41 @@ static int axcl_init_decoder(AVCodecContext *avctx)
     return ret;
 }
 
+static int axcl_close_decoder(AVCodecContext *avctx)
+{
+    AXCLDecodeContext *axcl_context = avctx->priv_data;
+    AXCLDecoder *decoder = (AXCLDecoder *)axcl_context->decoder;
+
+    dma_buffer_free(axcl_context->cma_allocator);
+
+    av_packet_unref(&decoder->packet);
+
+    int32_t count = 1;
+    /* step09: stop vdec and demuxer */
+    for (int32_t i = 0; i < count; ++i) {
+        /**
+         * bugfix:
+         * Stop vdec first; otherwise `sample_vdec_send_stream(-1)` may hang.
+        */
+        sample_vdec_stop(axcl_context->grp);
+    }
+
+    /* step10: deinit vdec module */
+    av_log(avctx, AV_LOG_INFO, "deinit vdec\n");
+    sample_vdec_deinit();
+
+    /* step11: deinit sys module */
+    av_log(avctx, AV_LOG_INFO, "deinit sys\n");
+    AXCL_SYS_Deinit();
+
+    /* step12: deinit axcl */
+    av_log(avctx, AV_LOG_INFO, "axcl deinit\n");
+    axclrtResetDevice(axcl_context->device_id);
+    axclFinalize();
+
+    return 0;
+}
+
 static int axcl_convert_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     AXCLDecodeContext *axcl_context = avctx->priv_data;
@@ -813,11 +773,6 @@ static void axcl_flush(AVCodecContext *avctx)
     av_packet_unref(&decoder->packet);
 }
 
-static const AVCodecHWConfigInternal *const axcl_hw_configs[] = {
-        HW_CONFIG_INTERNAL(YUV420P),
-        NULL
-};
-
 #define AXCL_DEC_CLASS(NAME) \
     static const AVClass axcl_##NAME##_dec_class = { \
         .class_name = "axcl_" #NAME "_dec", \
@@ -837,10 +792,9 @@ static const AVCodecHWConfigInternal *const axcl_hw_configs[] = {
         FF_CODEC_RECEIVE_FRAME_CB(axcl_receive_frame), \
         .flush          = axcl_flush, \
         .p.priv_class   = &axcl_##NAME##_dec_class, \
-        .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
+        .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING, \
         .p.pix_fmts     = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, \
                                                          AV_PIX_FMT_NONE}, \
-        .hw_configs     = axcl_hw_configs, \
         .bsfs           = BSFS, \
         .p.wrapper_name = "axcl", \
         .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE, \
