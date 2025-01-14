@@ -1,3 +1,10 @@
+## FFMPEG AXCL编解码器适配
+
+    # 问题不少，勉强能跑。二六四好，二六五倒。
+    ./configure --prefix=build --enable-axcl
+    make -j 16
+    ./ffplay -vcodec h264_axcl h264.mp4
+
 FFmpeg README
 =============
 

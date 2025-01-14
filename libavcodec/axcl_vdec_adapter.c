@@ -36,15 +36,14 @@
 #include "libavutil/hwcontext_drm.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
+#include "libavutil/refstruct.h"
 
+#include "axcl/ax_base_type.h"
 #include "axcl/axcl_base.h"
 #include "axcl/axcl.h"
 #include "axcl/ax_buffer_tool.h"
-
-#if CONFIG_LIBRGA
-#include <rga/rga.h>
-#include <rga/RgaApi.h>
-#endif
+#include "axcl_dma_buffer.h"
 
 // HACK: Older BSP kernel use NA12 for NV15.
 #ifndef DRM_FORMAT_NV15 // fourcc_code('N', 'V', '1', '5')
@@ -77,9 +76,7 @@ typedef struct {
 } SAMPLE_VDEC_CHN_INFO;
 
 typedef struct {
-    MppCtx ctx;
-    MppApi *mpi;
-    MppBufferGroup frame_group;
+    AX_VDEC_STREAM_T stream;
 
     int8_t eos;
     int8_t draining;
@@ -101,14 +98,11 @@ typedef struct {
     AXCLDecoder *decoder;           ///< RefStruct reference
     AX_VDEC_GRP grp;
     SAMPLE_VDEC_CHN_INFO chn_info;
+    AX_VIDEO_FRAME_INFO_T axcl_frame;
     int32_t device_id;
     axclrtContext context;
+    void* cma_allocator;
 } AXCLDecodeContext;
-
-typedef struct {
-    MppFrame frame;
-    AVBufferRef *decoder_ref;
-} RKMPPFrameContext;
 
 struct stream_info {
     struct video_info {
@@ -126,108 +120,26 @@ struct stream_info {
     } audio;
 };
 
-static MppCodingType rkmpp_get_codingtype(AVCodecContext *avctx)
-{
-    switch (avctx->codec_id) {
-        case AV_CODEC_ID_H263:          return MPP_VIDEO_CodingH263;
-        case AV_CODEC_ID_H264:          return MPP_VIDEO_CodingAVC;
-        case AV_CODEC_ID_HEVC:          return MPP_VIDEO_CodingHEVC;
-        case AV_CODEC_ID_AV1:           return MPP_VIDEO_CodingAV1;
-        case AV_CODEC_ID_VP8:           return MPP_VIDEO_CodingVP8;
-        case AV_CODEC_ID_VP9:           return MPP_VIDEO_CodingVP9;
-        case AV_CODEC_ID_MPEG1VIDEO:    /* fallthrough */
-        case AV_CODEC_ID_MPEG2VIDEO:    return MPP_VIDEO_CodingMPEG2;
-        case AV_CODEC_ID_MPEG4:         return MPP_VIDEO_CodingMPEG4;
-        default:                        return MPP_VIDEO_CodingUnused;
-    }
-}
-
-static uint32_t rkmpp_get_frameformat(MppFrameFormat mppformat)
-{
-    switch (mppformat & MPP_FRAME_FMT_MASK) {
-        case MPP_FMT_YUV420SP:          return DRM_FORMAT_NV12;
-        case MPP_FMT_YUV420SP_10BIT:    return DRM_FORMAT_NV15;
-        case MPP_FMT_YUV422SP:          return DRM_FORMAT_NV16;
-        default:                        return 0;
-    }
-}
-
-static uint32_t rkmpp_get_avformat(MppFrameFormat mppformat)
-{
-    switch (mppformat & MPP_FRAME_FMT_MASK) {
-        case MPP_FMT_YUV420SP:          return AV_PIX_FMT_NV12;
-        case MPP_FMT_YUV420SP_10BIT:    return AV_PIX_FMT_NONE;
-        case MPP_FMT_YUV422SP:          return AV_PIX_FMT_NV16;
-        default:                        return 0;
-    }
-}
-
-#if CONFIG_LIBRGA
-static uint32_t rkmpp_get_rgaformat(MppFrameFormat mppformat)
-{
-    switch (mppformat & MPP_FRAME_FMT_MASK) {
-    case MPP_FMT_YUV420SP:          return RK_FORMAT_YCbCr_420_SP;
-    case MPP_FMT_YUV420SP_10BIT:    return RK_FORMAT_YCbCr_420_SP_10B;
-    case MPP_FMT_YUV422SP:          return RK_FORMAT_YCbCr_422_SP;
-    default:                        return RK_FORMAT_UNKNOWN;
-    }
-}
-#endif
-
 static int axcl_close_decoder(AVCodecContext *avctx)
 {
-    RKMPPDecodeContext *rk_context = avctx->priv_data;
-    RKMPPDecoder *decoder = (RKMPPDecoder *)rk_context->decoder_ref->data;
+    AXCLDecodeContext *axcl_context = avctx->priv_data;
+    dma_buffer_destroy(axcl_context->cma_allocator);
+    AXCLDecoder *decoder = (AXCLDecoder *)axcl_context->decoder;
+
+    dma_buffer_free(axcl_context->cma_allocator);
 
     av_packet_unref(&decoder->packet);
-
-    av_buffer_unref(&rk_context->decoder_ref);
     return 0;
 }
 
-static void rkmpp_release_decoder(void *opaque, uint8_t *data)
+static void axcl_release_decoder(AVRefStructOpaque opaque, void *data)
 {
-    RKMPPDecoder *decoder = (RKMPPDecoder *)data;
-
-    if (decoder->mpi) {
-        decoder->mpi->reset(decoder->ctx);
-        mpp_destroy(decoder->ctx);
-        decoder->ctx = NULL;
-    }
-
-    if (decoder->frame_group) {
-        mpp_buffer_group_put(decoder->frame_group);
-        decoder->frame_group = NULL;
-    }
+    AXCLDecoder *decoder = (AXCLDecoder *)data;
 
     av_buffer_unref(&decoder->frames_ref);
     av_buffer_unref(&decoder->device_ref);
 
     av_free(decoder);
-}
-
-static int rkmpp_prepare_decoder(AVCodecContext *avctx)
-{
-    RKMPPDecodeContext *rk_context = avctx->priv_data;
-    RKMPPDecoder *decoder = (RKMPPDecoder *)rk_context->decoder_ref->data;
-    MppPacket packet;
-    int ret;
-
-    // HACK: somehow MPP cannot handle extra data for AV1
-    if (avctx->extradata_size && avctx->codec_id != AV_CODEC_ID_AV1) {
-        ret = mpp_packet_init(&packet, avctx->extradata, avctx->extradata_size);
-        if (ret < 0)
-            return AVERROR_UNKNOWN;
-        ret = decoder->mpi->decode_put_packet(decoder->ctx, packet);
-        mpp_packet_deinit(&packet);
-        if (ret < 0)
-            return AVERROR_UNKNOWN;
-    }
-
-    // wait for decode result after feeding any packets
-    if (getenv("FFMPEG_RKMPP_SYNC"))
-        decoder->sync = 1;
-    return 0;
 }
 
 static AX_S32 sample_vdec_init(void) {
@@ -253,23 +165,6 @@ static AX_S32 sample_vdec_release_frame(AX_VDEC_GRP grp, AX_VDEC_CHN chn, const 
 
 static AX_S32 sample_vdec_send_stream(AX_VDEC_GRP grp, const AX_VDEC_STREAM_T *stream, AX_S32 timeout) {
     return AXCL_VDEC_SendStream(grp, stream, timeout);
-}
-
-static void on_receive_demux_stream_data(AVCodecContext *avctx, AX_VDEC_GRP grp, const struct stream_data *data) {
-    AX_VDEC_STREAM_T stream;
-    memset(&stream, 0, sizeof(stream));
-    stream.u64PTS = data->video.pts;
-    stream.u32StreamPackLen = data->video.size;
-    stream.pu8Addr = data->video.data;
-    stream.bEndOfFrame = AX_TRUE;
-    if (0 == data->video.size) {
-        stream.bEndOfStream = AX_TRUE;
-    }
-
-    AX_S32 ret = sample_vdec_send_stream(grp, &stream, -1);
-    if (0 != ret) {
-        av_log(avctx, AV_LOG_ERROR, "[decoder %2d] send stream (id: %ld, size: %u) fail, ret = 0x%x\n", grp, data->video.seq_num, data->video.size, ret);
-    }
 }
 
 static int sample_get_decoded_image_thread(AVCodecContext *avctx, AVFrame *frame) {
@@ -488,7 +383,30 @@ static int axcl_init_decoder(AVCodecContext *avctx)
 
     axclError ret;
 
-    AXCLDecodeContext *axcl_context = avctx->priv_data;
+    AXCLDecodeContext *axcl_context  = avctx->priv_data;
+    struct dma_buffer cma_allocator = {
+            .m_fd = -1,  // 初始化文件描述符为-1
+            .m_mem = {
+                    .size = 0,
+                    .vir = NULL,
+                    .phy = 0,
+            }
+    };
+    dma_buffer_init(&cma_allocator);
+    axcl_context->cma_allocator = &cma_allocator;
+
+    AX_VIDEO_FRAME_INFO_T axcl_frame = axcl_context->axcl_frame;
+    memset(&axcl_frame, 0, sizeof(axcl_frame));
+
+    // create a decoder and a ref to it
+    AXCLDecoder *decoder = NULL;
+    decoder = av_refstruct_alloc_ext(sizeof(*decoder), 0,
+                                     NULL, axcl_release_decoder);
+    if (!decoder) {
+        ret = AVERROR(ENOMEM);
+        av_refstruct_unref(decoder);
+    }
+    axcl_context->decoder = decoder;
 
     /* step01: axcl initialize */
     av_log(avctx, AV_LOG_INFO, "json: %s\n", json);
@@ -599,6 +517,19 @@ static int axcl_init_decoder(AVCodecContext *avctx)
         axcl_context->grp = grp;
         axcl_context->chn_info = chn_info;
         axcl_context->device_id = device_id;
+
+        const size_t size = ALIGN_UP(chn_info.u32PicWidth, VDEC_STRIDE_ALIGN) * chn_info.u32PicHeight * 3 / 2;
+        if (size <= 0) {
+            axclrtDestroyContext(context);
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] decode nv12 frame size = %ld\n", grp, size);
+            return AV_LOG_ERROR;
+        }
+
+        if (!dma_buffer_alloc(&cma_allocator, size)) {
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] alloc cma mem size %ld fail\n", grp, size);
+            axclrtDestroyContext(context);
+            return AV_LOG_ERROR;
+        }
 //
 //        decode_threads[i].start(name, sample_get_decoded_image_thread, grp, device_id, &decode_eof_events[i], chn_info, dump);
 //
@@ -610,84 +541,53 @@ static int axcl_init_decoder(AVCodecContext *avctx)
     return ret;
 }
 
-static void rkmpp_release_frame(void *opaque, uint8_t *data)
+static int axcl_convert_frame(AVCodecContext *avctx, AVFrame *frame)
 {
-    AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)data;
-    AVBufferRef *framecontextref = (AVBufferRef *)opaque;
-    RKMPPFrameContext *framecontext = (RKMPPFrameContext *)framecontextref->data;
+    AXCLDecodeContext *axcl_context = avctx->priv_data;
+    AX_VDEC_GRP grp = axcl_context->grp;
+    SAMPLE_VDEC_CHN_INFO chn_info = axcl_context->chn_info;
+    AX_VIDEO_FRAME_INFO_T *axcl_frame = &axcl_context->axcl_frame;
+    void* cma_allocator = axcl_context->cma_allocator;
+    int32_t device_id = axcl_context->device_id;
+    AXCLDecoder *decoder = axcl_context->decoder;
+    AX_VDEC_STREAM_T *stream = &decoder->stream;
+    AVPacket *packet = &decoder->packet;
 
-    mpp_frame_deinit(&framecontext->frame);
-    av_buffer_unref(&framecontext->decoder_ref);
-    av_buffer_unref(&framecontextref);
+    axclError ret;
 
-    av_free(desc);
-}
+    const size_t size = ALIGN_UP(chn_info.u32PicWidth, VDEC_STRIDE_ALIGN) * chn_info.u32PicHeight * 3 / 2;
 
-static int rkmpp_convert_frame(AVCodecContext *avctx, AVFrame *frame,
-                               MppFrame mppframe, MppBuffer buffer)
-{
-    char *src = mpp_buffer_get_ptr(buffer);
+    ret = axclrtMemcpy((void *) dma_buffer_get(cma_allocator)->phy,
+                       (const void *) axcl_frame->stVFrame.u64PhyAddr[0], size,
+                       AXCL_MEMCPY_DEVICE_TO_HOST_PHY);
+    if (AXCL_SUCC != ret) {
+        av_log(avctx, AV_LOG_ERROR, "copy rawframe from device to cpu, ret = 0x%x\n", ret);
+        return ret;
+    }
+
+    char *src = dma_buffer_get(cma_allocator)->vir;
     char *dst_y = frame->data[0];
     char *dst_u = frame->data[1];
     char *dst_v = frame->data[2];
-#if CONFIG_LIBRGA
-    RgaSURF_FORMAT format = rkmpp_get_rgaformat(mpp_frame_get_fmt(mppframe));
-#endif
-    int width = mpp_frame_get_width(mppframe);
-    int height = mpp_frame_get_height(mppframe);
-    int hstride = mpp_frame_get_hor_stride(mppframe);
-    int vstride = mpp_frame_get_ver_stride(mppframe);
+    int width = axcl_frame->stVFrame.u32Width;
+    int height = axcl_frame->stVFrame.u32Height;
+    int hstride = ALIGN_UP(width, VDEC_STRIDE_ALIGN);
+    int vstride = height;
     int y_pitch = frame->linesize[0];
     int u_pitch = frame->linesize[1];
     int v_pitch = frame->linesize[2];
     int i, j;
 
-#if CONFIG_LIBRGA
-    rga_info_t src_info = {0};
-    rga_info_t dst_info = {0};
-    int dst_height = (dst_u - dst_y) / y_pitch;
+    // 打印src的前10个字节
+//    for (int i = 0; i < 10; i++) {
+//        av_log(avctx, AV_LOG_WARNING, "src[%d] = %d\n", i, src[i]);
+//    }
 
-    static int rga_supported = 1;
-    static int rga_inited = 0;
+    // 创建文件/tmp/fuck.yuv，并将src的yuv数据写入到本地文件/tmp/fuck.yuv
+//    FILE *fp = fopen("/tmp/fuck.yuv", "wb");
+//    fwrite(src, 1, size, fp);
 
-    if (!rga_supported)
-        goto bail;
-
-    if (!rga_inited) {
-        if (c_RkRgaInit() < 0) {
-            rga_supported = 0;
-            av_log(avctx, AV_LOG_WARNING, "RGA not available\n");
-            goto bail;
-        }
-        rga_inited = 1;
-    }
-
-    if (format == RK_FORMAT_UNKNOWN)
-        goto bail;
-
-    if (u_pitch != y_pitch / 2 || v_pitch != y_pitch / 2 ||
-        dst_u != dst_y + y_pitch * dst_height ||
-        dst_v != dst_u + u_pitch * dst_height / 2)
-        goto bail;
-
-    src_info.fd = mpp_buffer_get_fd(buffer);
-    src_info.mmuFlag = 1;
-    rga_set_rect(&src_info.rect, 0, 0, width, height, hstride, vstride,
-                 format);
-
-    dst_info.virAddr = dst_y;
-    dst_info.mmuFlag = 1;
-    rga_set_rect(&dst_info.rect, 0, 0, frame->width, frame->height,
-                 y_pitch, dst_height, RK_FORMAT_YCbCr_420_P);
-
-    if (c_RkRgaBlit(&src_info, &dst_info, NULL) < 0)
-        goto bail;
-
-    return 0;
-
-bail:
-#endif
-    if (mpp_frame_get_fmt(mppframe) != MPP_FMT_YUV420SP) {
+    if (axcl_frame->stVFrame.enImgFormat != AX_FORMAT_YUV420_SEMIPLANAR) {
         av_log(avctx, AV_LOG_WARNING, "Unable to convert\n");
         return -1;
     }
@@ -700,7 +600,7 @@ bail:
     src += hstride * vstride;
 
     for (i = 0; i < frame->height / 2; i++) {
-        for (j = 0; j < frame->width; j++) {
+        for (j = 0; j < frame->width / 2; j++) {
             dst_u[j] = src[2 * j + 0];
             dst_v[j] = src[2 * j + 1];
         }
@@ -712,241 +612,97 @@ bail:
     return 0;
 }
 
-static void rkmpp_update_fps(AVCodecContext *avctx)
-{
-    RKMPPDecodeContext *rk_context = avctx->priv_data;
-    RKMPPDecoder *decoder = (RKMPPDecoder *)rk_context->decoder_ref->data;
-    struct timeval tv;
-    uint64_t curr_time;
-    float fps;
-
-    if (!decoder->print_fps)
-        return;
-
-    if (!decoder->last_fps_time) {
-        gettimeofday(&tv, NULL);
-        decoder->last_fps_time = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-    }
-
-    if (++decoder->frames % FPS_UPDATE_INTERVAL)
-        return;
-
-    gettimeofday(&tv, NULL);
-    curr_time = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-
-    fps = 1000.0f * FPS_UPDATE_INTERVAL / (curr_time - decoder->last_fps_time);
-    decoder->last_fps_time = curr_time;
-
-    av_log(avctx, AV_LOG_INFO,
-           "[FFMPEG RKMPP] FPS: %6.1f || Frames: %" PRIu64 "\n",
-           fps, decoder->frames);
-}
-
 static int axcl_get_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     AXCLDecodeContext *axcl_context = avctx->priv_data;
     AX_VDEC_GRP grp = axcl_context->grp;
     SAMPLE_VDEC_CHN_INFO chn_info = axcl_context->chn_info;
+    AX_VIDEO_FRAME_INFO_T *axcl_frame = &axcl_context->axcl_frame;
     int32_t device_id = axcl_context->device_id;
     AXCLDecoder *decoder = axcl_context->decoder;
+    AX_VDEC_STREAM_T *stream = &decoder->stream;
     AVPacket *packet = &decoder->packet;
 
-    RKMPPFrameContext *framecontext = NULL;
-    AVBufferRef *framecontextref = NULL;
-    int ret;
-    MppFrame mppframe = NULL;
-    MppBuffer buffer = NULL;
-    AVDRMFrameDescriptor *desc = NULL;
-    AVDRMLayerDescriptor *layer = NULL;
-    int mode;
-    MppFrameFormat mppformat;
-    uint32_t drmformat;
+    axclError ret;
 
     // should not provide any frame after EOS
     if (decoder->eos)
         return AVERROR_EOF;
 
-    decoder->mpi->control(decoder->ctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout);
-
-    ret = decoder->mpi->decode_get_frame(decoder->ctx, &mppframe);
-    if (ret != MPP_OK && ret != MPP_ERR_TIMEOUT) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get frame (code = %d)\n", ret);
-        return AVERROR_UNKNOWN;
-    }
-
-    if (!mppframe) {
-        if (timeout != MPP_TIMEOUT_NON_BLOCK)
-            av_log(avctx, AV_LOG_DEBUG, "Timeout getting decoded frame.\n");
-        return AVERROR(EAGAIN);
-    }
-
-    if (mpp_frame_get_eos(mppframe)) {
-        av_log(avctx, AV_LOG_DEBUG, "Received a EOS frame.\n");
-        decoder->eos = 1;
-        ret = AVERROR_EOF;
-        goto fail;
-    }
-
-    if (mpp_frame_get_discard(mppframe)) {
-        av_log(avctx, AV_LOG_DEBUG, "Received a discard frame.\n");
-        ret = AVERROR(EAGAIN);
-        goto fail;
-    }
-
-    if (mpp_frame_get_errinfo(mppframe)) {
-        av_log(avctx, AV_LOG_ERROR, "Received a errinfo frame.\n");
-        ret = AVERROR_UNKNOWN;
-        goto fail;
-    }
-
-    if (mpp_frame_get_info_change(mppframe)) {
-        AVHWFramesContext *hwframes;
-
-        av_log(avctx, AV_LOG_INFO, "Decoder noticed an info change (%dx%d), format=%d\n",
-               (int)mpp_frame_get_width(mppframe), (int)mpp_frame_get_height(mppframe),
-               (int)mpp_frame_get_fmt(mppframe));
-
-        avctx->width = mpp_frame_get_width(mppframe);
-        avctx->height = mpp_frame_get_height(mppframe);
-
-        // chromium would align planes' width and height to 32, adding this
-        // hack to avoid breaking the plane buffers' contiguous.
-        avctx->coded_width = FFALIGN(avctx->width, 64);
-        avctx->coded_height = FFALIGN(avctx->height, 64);
-
-        decoder->mpi->control(decoder->ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
-
-        av_buffer_unref(&decoder->frames_ref);
-
-        decoder->frames_ref = av_hwframe_ctx_alloc(decoder->device_ref);
-        if (!decoder->frames_ref) {
-            ret = AVERROR(ENOMEM);
-            goto fail;
-        }
-
-        mppformat = mpp_frame_get_fmt(mppframe);
-
-        hwframes = (AVHWFramesContext*)decoder->frames_ref->data;
-        hwframes->format    = AV_PIX_FMT_DRM_PRIME;
-        hwframes->sw_format = rkmpp_get_avformat(mppformat);
-        hwframes->width     = avctx->width;
-        hwframes->height    = avctx->height;
-        ret = av_hwframe_ctx_init(decoder->frames_ref);
-        if (!ret)
-            ret = AVERROR(EAGAIN);
-
-        goto fail;
-    }
-
     // here we should have a valid frame
     av_log(avctx, AV_LOG_DEBUG, "Received a frame.\n");
 
-    // now setup the frame buffer info
-    buffer = mpp_frame_get_buffer(mppframe);
-    if (!buffer) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get the frame buffer, frame is dropped (code = %d)\n", ret);
-        ret = AVERROR(EAGAIN);
-        goto fail;
+    if (stream->bEndOfStream) {
+        av_log(avctx, AV_LOG_DEBUG, "Received a EOS frame.\n");
+        decoder->eos = 1;
+        ret = AVERROR_EOF;
+        return ret;
     }
 
-    rkmpp_update_fps(avctx);
+    const AX_VDEC_CHN chn = chn_info.u32ChnId;
 
-    if (avctx->pix_fmt != AV_PIX_FMT_DRM_PRIME) {
-        ret = ff_get_buffer(avctx, frame, 0);
-        if (ret < 0)
-            goto out;
+    const size_t size = ALIGN_UP(chn_info.u32PicWidth, VDEC_STRIDE_ALIGN) * chn_info.u32PicHeight * 3 / 2;
+
+    /* step02: get decoded image */
+    ret = sample_vdec_get_frame(grp, chn, axcl_frame, 100);
+    if (0 != ret) {
+        if (AX_ERR_VDEC_UNEXIST == ret) {
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] grp is destroyed\n", grp);
+            goto fail;
+        } else if (AX_ERR_VDEC_STRM_ERROR == ret) {
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] stream is undecodeable\n", grp);
+            goto fail;
+        } else if (AX_ERR_VDEC_FLOW_END == ret) {
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] flow end\n", grp);
+            goto fail;
+        } else {
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] get frame fail, ret = 0x%x\n", grp, ret);
+            goto fail;
+        }
     }
+
+    // TODO: axcl frame to ffmpeg frame
+    avctx->width = axcl_frame->stVFrame.u32Width;
+    avctx->height = axcl_frame->stVFrame.u32Height;
+    avctx->pix_fmt = AV_PIX_FMT_YUV420P;  // todo: ax 和 ffmpeg对应匹配
+    av_log(avctx, AV_LOG_INFO, "Decoder noticed an info change (%dx%d), format=%d\n",
+           avctx->width, avctx->height, avctx->pix_fmt);
+
+    // chromium would align planes' width and height to 32, adding this
+    // hack to avoid breaking the plane buffers' contiguous.
+    avctx->coded_width = FFALIGN(avctx->width, 64);
+    avctx->coded_height = FFALIGN(avctx->height, 64);
+
+    ret = ff_get_buffer(avctx, frame, 0);
+    if (ret < 0)
+        goto out;
 
     // setup general frame fields
     frame->format           = avctx->pix_fmt;
-    frame->width            = mpp_frame_get_width(mppframe);
-    frame->height           = mpp_frame_get_height(mppframe);
-    frame->pts              = mpp_frame_get_pts(mppframe);
-    frame->reordered_opaque = frame->pts;
-    frame->color_range      = mpp_frame_get_color_range(mppframe);
-    frame->color_primaries  = mpp_frame_get_color_primaries(mppframe);
-    frame->color_trc        = mpp_frame_get_color_trc(mppframe);
-    frame->colorspace       = mpp_frame_get_colorspace(mppframe);
+    frame->width            = axcl_frame->stVFrame.u32Width;
+    frame->height           = axcl_frame->stVFrame.u32Height;
+    frame->pts              = axcl_frame->stVFrame.u64PTS;
 
-    mode = mpp_frame_get_mode(mppframe);
-    frame->interlaced_frame = ((mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED);
-    frame->top_field_first  = ((mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST);
+    ret = axcl_convert_frame(avctx, frame);
 
-    if (avctx->pix_fmt != AV_PIX_FMT_DRM_PRIME) {
-        ret = rkmpp_convert_frame(avctx, frame, mppframe, buffer);
-        goto out;
-    }
-
-    mppformat = mpp_frame_get_fmt(mppframe);
-    drmformat = rkmpp_get_frameformat(mppformat);
-
-    desc = av_mallocz(sizeof(AVDRMFrameDescriptor));
-    if (!desc) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    desc->nb_objects = 1;
-    desc->objects[0].fd = mpp_buffer_get_fd(buffer);
-    desc->objects[0].size = mpp_buffer_get_size(buffer);
-
-    desc->nb_layers = 1;
-    layer = &desc->layers[0];
-    layer->format = drmformat;
-    layer->nb_planes = 2;
-
-    layer->planes[0].object_index = 0;
-    layer->planes[0].offset = 0;
-    layer->planes[0].pitch = mpp_frame_get_hor_stride(mppframe);
-
-    layer->planes[1].object_index = 0;
-    layer->planes[1].offset = layer->planes[0].pitch * mpp_frame_get_ver_stride(mppframe);
-    layer->planes[1].pitch = layer->planes[0].pitch;
-
-    // we also allocate a struct in buf[0] that will allow to hold additionnal information
-    // for releasing properly MPP frames and decoder
-    framecontextref = av_buffer_allocz(sizeof(*framecontext));
-    if (!framecontextref) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    // MPP decoder needs to be closed only when all frames have been released.
-    framecontext = (RKMPPFrameContext *)framecontextref->data;
-    framecontext->decoder_ref = av_buffer_ref(rk_context->decoder_ref);
-    framecontext->frame = mppframe;
-
-    frame->data[0]  = (uint8_t *)desc;
-    frame->buf[0]   = av_buffer_create((uint8_t *)desc, sizeof(*desc), rkmpp_release_frame,
-                                       framecontextref, AV_BUFFER_FLAG_READONLY);
-
-    if (!frame->buf[0]) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    frame->hw_frames_ctx = av_buffer_ref(decoder->frames_ref);
-    if (!frame->hw_frames_ctx) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
+    /* TODO: */
+    if (0 == ret) {
+        /* step03: release decoded image */
+        ret = sample_vdec_release_frame(grp, chn, axcl_frame);
+        if (0 != ret){
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] release frame fail, ret = 0x%x\n", grp, ret);
+            goto fail;
+        }
     }
 
     return 0;
 
     out:
     fail:
-    if (mppframe)
-        mpp_frame_deinit(&mppframe);
-
-    if (framecontext)
-        av_buffer_unref(&framecontext->decoder_ref);
-
-    if (framecontextref)
-        av_buffer_unref(&framecontextref);
-
-    if (desc)
-        av_free(desc);
-
+        ret = sample_vdec_release_frame(grp, chn, axcl_frame);
+        if (0 != ret){
+            av_log(avctx, AV_LOG_ERROR, "[decoder %2d] goto fail: release frame fail, ret = 0x%x\n", grp, ret);
+        }
     return ret;
 }
 
@@ -983,31 +739,6 @@ static int axcl_send_packet(AVCodecContext *avctx, AVPacket *packet, AX_S32 time
     return 0;
 }
 
-static int rkmpp_send_eos(AVCodecContext *avctx)
-{
-    RKMPPDecodeContext *rk_context = avctx->priv_data;
-    RKMPPDecoder *decoder = (RKMPPDecoder *)rk_context->decoder_ref->data;
-    MppPacket mpkt;
-    int ret;
-
-    ret = mpp_packet_init(&mpkt, NULL, 0);
-    if (ret != MPP_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to init EOS packet (code = %d)\n", ret);
-        return AVERROR_UNKNOWN;
-    }
-
-    mpp_packet_set_eos(mpkt);
-
-    do {
-        ret = decoder->mpi->decode_put_packet(decoder->ctx, mpkt);
-    } while (ret != MPP_OK);
-    mpp_packet_deinit(&mpkt);
-
-    decoder->draining = 1;
-
-    return 0;
-}
-
 static int axcl_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     AXCLDecodeContext *axcl_context = avctx->priv_data;
@@ -1016,17 +747,15 @@ static int axcl_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     int32_t device_id = axcl_context->device_id;
     axclrtContext context = axcl_context->context;
     AXCLDecoder *decoder = axcl_context->decoder;
+    AX_VDEC_STREAM_T *stream = &decoder->stream;
     AVPacket *packet = &decoder->packet;
     axclError ret;
 
-    /* step01: set thread context */
-    ret = axclrtSetCurrentContext(context);
+    ret = axclrtSetCurrentContext(axcl_context->context);
     if (AXCL_SUCC != ret) {
         return ret;
     }
-
-    AX_VDEC_STREAM_T stream;
-    memset(&stream, 0, sizeof(stream));
+    memset(stream, 0, sizeof(&stream));
 
     // no more frames after EOS
     if (decoder->eos)
@@ -1042,15 +771,18 @@ static int axcl_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             if (ret == AVERROR_EOF) {
                 av_log(avctx, AV_LOG_DEBUG, "End of stream.\n");
                 // send EOS and start draining
-                stream.bEndOfFrame = AX_TRUE;
-                decoder->draining = 1;
+                stream->bEndOfStream = AX_TRUE;
+                decoder->draining    = 1;
                 return axcl_get_frame(avctx, frame);
-            } else if (ret == AVERROR(EAGAIN)) {
-                // not blocking so that we can feed new data ASAP
-                return axcl_get_frame(avctx, frame);
+//                return ret;  // todo: dont know how to decode the last frame without forever blocking
+//            } else if (ret == AVERROR(EAGAIN)) {
+//                av_log(avctx, AV_LOG_ERROR, "No packet.\n");
+//                return AVERROR(EAGAIN);
             } else if (ret < 0) {
-                av_log(avctx, AV_LOG_ERROR, "Failed to get packet (code = %d)\n", ret);
+                av_log(avctx, AV_LOG_DEBUG, "Failed to get packet (code = %d)\n", ret);
                 return ret;
+            } else {
+                av_log(avctx, AV_LOG_DEBUG, "Got a packet of size %d\n", packet->size);
             }
         } else {
             // send pending data to decoder
@@ -1061,10 +793,7 @@ static int axcl_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             } else {
                 av_packet_unref(packet);
                 packet->size = 0;
-
-                // blocked waiting for decode result
-                if (decoder->sync)
-                    return axcl_get_frame(avctx, frame);
+                return axcl_get_frame(avctx, frame);
             }
         }
     }
@@ -1072,14 +801,10 @@ static int axcl_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
 static void axcl_flush(AVCodecContext *avctx)
 {
-    RKMPPDecodeContext *rk_context = avctx->priv_data;
-    RKMPPDecoder *decoder = (RKMPPDecoder *)rk_context->decoder_ref->data;
+    AXCLDecodeContext *axcl_context = avctx->priv_data;
+    AXCLDecoder *decoder = (AXCLDecoder *)axcl_context->decoder;
 
     av_log(avctx, AV_LOG_DEBUG, "Flush.\n");
-
-    decoder->mpi->reset(decoder->ctx);
-
-    rkmpp_prepare_decoder(avctx);
 
     decoder->eos = 0;
     decoder->draining = 0;

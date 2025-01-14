@@ -418,7 +418,7 @@ OBJS-$(CONFIG_H264_DECODER)            += h264dec.o h264_cabac.o h264_cavlc.o \
                                           h264_refs.o \
                                           h264_slice.o h264data.o h274.o
 OBJS-$(CONFIG_H264_AMF_ENCODER)        += amfenc_h264.o
-OBJS-$(CONFIG_H264_AXCL_DECODER)       += axcl_vdec.o axcl_dma_buffer.o
+OBJS-$(CONFIG_H264_AXCL_DECODER)       += axcl_vdec_adapter.o axcl_dma_buffer.o
 OBJS-$(CONFIG_H264_CUVID_DECODER)      += cuviddec.o
 OBJS-$(CONFIG_H264_MEDIACODEC_DECODER) += mediacodecdec.o
 OBJS-$(CONFIG_H264_MEDIACODEC_ENCODER) += mediacodecenc.o
@@ -445,7 +445,7 @@ OBJS-$(CONFIG_HDR_DECODER)             += hdrdec.o
 OBJS-$(CONFIG_HDR_ENCODER)             += hdrenc.o
 OBJS-$(CONFIG_HEVC_DECODER)            += aom_film_grain.o h274.o
 OBJS-$(CONFIG_HEVC_AMF_ENCODER)        += amfenc_hevc.o
-OBJS-$(CONFIG_HEVC_AXCL_DECODER)       += axcl_vdec.o
+OBJS-$(CONFIG_HEVC_AXCL_DECODER)       += axcl_vdec_adapter.o axcl_dma_buffer.o
 OBJS-$(CONFIG_HEVC_CUVID_DECODER)      += cuviddec.o
 OBJS-$(CONFIG_HEVC_D3D12VA_ENCODER)    += d3d12va_encode_hevc.o h265_profile_level.o \
                                           h2645data.o hw_base_encode_h265.o
