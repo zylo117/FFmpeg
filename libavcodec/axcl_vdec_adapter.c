@@ -46,6 +46,7 @@
 #include "axcl_dma_buffer.h"
 
 #define ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
+#define ALIGN_UP_EX(x, align) ((((x) / (align)) + 1) * (align))
 #define AX_SHIFT_LEFT_ALIGN(a) (1 << (a))
 #define VDEC_STRIDE_ALIGN AX_SHIFT_LEFT_ALIGN(8) /* VDEC stride align 256 */
 # define AXCL_SEND_STREAM_TIMEOUT (-1)
@@ -167,7 +168,7 @@ static SAMPLE_VDEC_ATTR sample_get_vdec_attr_from_stream_info(AVCodecContext *av
     vdec_attr.grp_attr.enCodecType = info->video.payload;
     vdec_attr.grp_attr.enInputMode = AX_VDEC_INPUT_MODE_FRAME;
     vdec_attr.grp_attr.u32MaxPicWidth = ALIGN_UP(info->video.width, 16);
-    vdec_attr.grp_attr.u32MaxPicHeight = ALIGN_UP(info->video.height, 16);
+    vdec_attr.grp_attr.u32MaxPicHeight = ALIGN_UP_EX(info->video.height, 16);
     vdec_attr.grp_attr.u32StreamBufSize = vdec_attr.grp_attr.u32MaxPicWidth * vdec_attr.grp_attr.u32MaxPicHeight * 2;
     vdec_attr.grp_attr.bSdkAutoFramePool = AX_TRUE;
 
